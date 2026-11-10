@@ -37,55 +37,73 @@ hands = mp_hands.Hands(
 from collections import deque
 
 class TextTracker:
-    def __init__(self, min_continuous=15, start_frame=5, movement_threshold=5):
+    """同じ文字が続いている間の手の移動を追跡し、動きを伴う指文字を判定する。
+
+    旧版からの変更点:
+    - 予測が max_miss フレーム以内だけ別の文字に揺れても、追跡を途切れさせない
+      （旧版は1フレームでも別の文字になるとリセットされ、速い指文字や予測のぶれに弱かった）。
+    - 移動量は手首の画像上の位置から求める（旧版は手首→中指付け根の相対ベクトルの変化を見ており、
+      手の回転には反応するが、手全体の移動はほとんど測れていなかった）。
+    - 移動量は追跡開始位置からの正味の変位とし、手のひらの大きさ（手首→中指付け根の長さ）で割って
+      正規化する。カメラとの距離や解像度が変わってもしきい値が同じ意味になる。
+      旧版は毎フレーム「数フレーム前からの変位」を足し合わせていたため、実際より数倍大きく出ていた。
+    - movement_threshold の単位は「手のひらの大きさ何個分か」。
+    """
+
+    def __init__(self, min_continuous=5, max_miss=2, movement_threshold=1.0):
         self.min_continuous = min_continuous
-        self.start_frame = start_frame
+        self.max_miss = max_miss
         self.movement_threshold = movement_threshold
         self.current_text = None
         self.continuous_count = 0
-        self.total_movement_x = 0
-        self.total_movement_y = 0
-        self.reference_points_history = deque(maxlen=start_frame)
+        self.miss_count = 0
+        self.start_pos = None
+        self.palm_sizes = []
+        self.last_pos = None
 
-    def update(self, new_text, reference_point_x, reference_point_y):
+    def update(self, new_text, wrist_x, wrist_y, palm_size):
         if self.current_text is None:
-            self.current_text = new_text
+            self.reset_tracker(new_text, wrist_x, wrist_y)
 
         if new_text == self.current_text:
             self.continuous_count += 1
-            if self.continuous_count >= self.start_frame:
-                self.accumulate_movement(reference_point_x, reference_point_y)
+            self.miss_count = 0
         else:
-            # 文字が変わったら初期化
-            self.reset_tracker(new_text)
+            self.miss_count += 1
+            if self.miss_count > self.max_miss:
+                # 別の文字が続いたので、新しい文字として追跡し直す
+                self.reset_tracker(new_text, wrist_x, wrist_y)
+                self.continuous_count = 1
 
-        if len(self.reference_points_history) == self.reference_points_history.maxlen:
-            self.reference_points_history.popleft()
-        self.reference_points_history.append((reference_point_x, reference_point_y))
+        if palm_size > 0:
+            self.palm_sizes.append(palm_size)
+        self.last_pos = (wrist_x, wrist_y)
 
         if self.continuous_count >= self.min_continuous:
             direction, distance = self.determine_major_movement()
-            if abs(distance) >= self.movement_threshold:
+            if distance >= self.movement_threshold:
                 return self.current_text, direction, distance
         return None, None, None
 
-    def accumulate_movement(self, current_x, current_y):
-        last_x, last_y = self.reference_points_history[0]
-        self.total_movement_x += current_x - last_x
-        self.total_movement_y += current_y - last_y
-
     def determine_major_movement(self):
-        if abs(self.total_movement_x) > abs(self.total_movement_y):
-            return 'Right', abs(self.total_movement_x)
-        else:
-            return 'Up', abs(self.total_movement_y)
+        """追跡開始位置からの正味の変位を、手のひらの大きさで正規化して返す。"""
+        if not self.palm_sizes:
+            return None, 0.0
+        palm = float(np.median(self.palm_sizes))
+        dx = (self.last_pos[0] - self.start_pos[0]) / palm
+        dy = (self.last_pos[1] - self.start_pos[1]) / palm
+        if abs(dx) > abs(dy):
+            return ('Right' if dx > 0 else 'Left'), abs(dx)
+        # 画像の y 軸は下向きなので、dy < 0 が上方向
+        return ('Up' if dy < 0 else 'Down'), abs(dy)
 
-    def reset_tracker(self, new_text):
+    def reset_tracker(self, new_text, wrist_x, wrist_y):
         self.current_text = new_text
         self.continuous_count = 0
-        self.total_movement_x = 0
-        self.total_movement_y = 0
-        self.reference_points_history.clear()
+        self.miss_count = 0
+        self.start_pos = (wrist_x, wrist_y)
+        self.palm_sizes = []
+        self.last_pos = (wrist_x, wrist_y)
 
 with open('hand.pickle', mode='rb') as f:
         svc = pickle.load(f)
@@ -108,7 +126,7 @@ for video_path in sorted(video_files):
     print(f"処理中: {video_path}")
     
     # 各動画ごとにTrackerを初期化
-    tracker = TextTracker(min_continuous=15, start_frame=10, movement_threshold=100)
+    tracker = TextTracker(min_continuous=5, max_miss=2, movement_threshold=1.0)
     
     cap = cv2.VideoCapture(video_path)
     
@@ -392,17 +410,16 @@ for video_path in sorted(video_files):
                                 # cv2.imwrite(outfile, img)
                                 # no += 1
                                 # 追跡を更新するために、認識された文字と参照点の座標を渡します。
-                                result, direction, distance = tracker.update(new_text=ans, reference_point_x=ReferencePoint_x, reference_point_y=ReferencePoint_y)
+                                palm_size = math.hypot(ReferencePoint_x, ReferencePoint_y)  # 手首→中指付け根の長さ
+                                result, direction, distance = tracker.update(
+                                        new_text=ans[0], wrist_x=WRIST_x, wrist_y=WRIST_y, palm_size=palm_size)
 
                                 # print(f"Result: {result}, Direction: {direction}, Distance: {distance}")
                                 print(ans)
-                                f = open('Finger_data_move.csv', mode="a", newline="")
-                                writer = csv.writer(f)
-
-                                # Assuming hand_data is a list of data points
-                                for data in hand_data:
-                                        writer.writerow([result, direction, distance])  # Enclose your data in a list
-                                f.close()
+                                # 学習データ（Finger_data_move.csv）と混ざらないよう、別のファイルに書き出す
+                                with open('move_recognition_result.csv', mode="a", newline="") as f:
+                                        writer = csv.writer(f)
+                                        writer.writerow([os.path.basename(video_path), ans[0], result, direction, distance])
 
     cap.release()
     cv2.destroyAllWindows()
